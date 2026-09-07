@@ -15,14 +15,17 @@ from openai import OpenAI
 # SETTINGS
 # ============================================================
 
-IMAGE_FOLDER = Path(
-    r"\\ccrmspace\ccrm\Projects\National derelict TRAP program\Virginia\photos\2026\batch_02"
+BASE_FOLDER = Path(
+    r"\\ccrmspace\ccrm\Projects\National derelict TRAP program\Virginia\photos\2026"
 )
 
-DATABASE_FILE = Path("results.db")
-CSV_FILE = Path("results.csv")
+DATABASE_FILE = Path("production_results.db")
+CSV_FILE = Path("production_results.csv")
 
-TEST_LIMIT = 20
+BATCH_START = 2
+BATCH_END = 29
+
+CSV_EXPORT_INTERVAL = 100
 
 MODEL = "gpt-5.6-terra"
 
@@ -39,10 +42,11 @@ IMAGE_EXTENSIONS = {
 }
 
 
-# 9 possible colors + unknown = 10 total outputs.
+# 9 color classes + wire + unknown = 11 total outputs.
 #
 # Brown is intentionally not included because mud/rust is
 # commonly brown and could cause false classifications.
+# "wire" represents a bare/uncoated metal trap, including rusty wire.
 ALLOWED_COLORS = [
     "green",
     "black",
@@ -53,6 +57,7 @@ ALLOWED_COLORS = [
     "white",
     "gray",
     "purple",
+    "wire",
     "unknown",
 ]
 
@@ -90,7 +95,9 @@ def initialize_database():
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS results (
-            filename TEXT PRIMARY KEY,
+            relative_path TEXT PRIMARY KEY,
+            batch TEXT NOT NULL,
+            filename TEXT NOT NULL,
             first_name TEXT,
             last_name TEXT,
             color TEXT,
@@ -109,6 +116,8 @@ def initialize_database():
 
 def save_result(
     connection,
+    relative_path,
+    batch,
     filename,
     first_name,
     last_name,
@@ -120,6 +129,8 @@ def save_result(
     connection.execute(
         """
         INSERT OR REPLACE INTO results (
+            relative_path,
+            batch,
             filename,
             first_name,
             last_name,
@@ -129,9 +140,11 @@ def save_result(
             error,
             processed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
+            relative_path,
+            batch,
             filename,
             first_name,
             last_name,
@@ -142,18 +155,17 @@ def save_result(
         ),
     )
 
-    # Save THIS result permanently before continuing.
+    # Save every result immediately.
     connection.commit()
 
-
-def already_successful(connection, filename):
+def already_successful(connection, relative_path):
     result = connection.execute(
         """
         SELECT status
         FROM results
-        WHERE filename = ?
+        WHERE relative_path = ?
         """,
-        (filename,),
+        (relative_path,),
     ).fetchone()
 
     return result is not None and result[0] == "success"
@@ -162,11 +174,12 @@ def already_successful(connection, filename):
 # ============================================================
 # CSV
 # ============================================================
-
 def export_csv(connection):
     rows = connection.execute(
         """
         SELECT
+            relative_path,
+            batch,
             filename,
             first_name,
             last_name,
@@ -175,11 +188,11 @@ def export_csv(connection):
             status,
             error
         FROM results
-        ORDER BY filename
+        ORDER BY batch, filename
         """
     ).fetchall()
 
-    temp_file = Path("results.csv.tmp")
+    temp_file = Path("production_results.csv.tmp")
 
     with open(
         temp_file,
@@ -192,6 +205,8 @@ def export_csv(connection):
 
         writer.writerow(
             [
+                "relative_path",
+                "batch",
                 "filename",
                 "first_name",
                 "last_name",
@@ -207,9 +222,7 @@ def export_csv(connection):
         file.flush()
         os.fsync(file.fileno())
 
-    # Replace old CSV only after new one is fully written.
     os.replace(temp_file, CSV_FILE)
-
 
 # ============================================================
 # FILENAME
@@ -319,6 +332,17 @@ Do NOT simply choose the most common color in the photograph.
 
 Do NOT interpret brown mud or brown/orange rust as the
 original trap color.
+
+WIRE CLASS:
+Return "wire" when the crab trap appears to be bare/uncoated metal wire
+rather than plastic-coated colored wire. A wire trap may be gray, metallic,
+darkened, or heavily rusted.
+
+Rust does NOT make a trap orange, red, brown, or black.
+
+Use "black" only when there is visible evidence of an actual black coating
+on the trap wire or frame. If the trap is rusty/dark bare metal with no
+clear colored plastic coating, classify it as "wire".
 
 CONFIDENCE:
 
@@ -437,82 +461,119 @@ def classify_with_retries(image_path):
 # ============================================================
 # MAIN
 # ============================================================
+def get_batch_images(batch_folder, retries=5):
 
+    for attempt in range(1, retries + 1):
+
+        try:
+            images = []
+
+            for file in batch_folder.iterdir():
+                if file.suffix.lower() in IMAGE_EXTENSIONS:
+                    images.append(file)
+
+            return sorted(images)
+
+        except OSError as error:
+
+            print()
+            print(
+                f"Network error while reading "
+                f"{batch_folder.name}"
+            )
+            print(error)
+
+            if attempt == retries:
+                raise
+
+            wait_seconds = 5 * attempt
+
+            print(
+                f"Retrying in {wait_seconds} seconds..."
+            )
+
+            time.sleep(wait_seconds)
 def main():
 
-    if not IMAGE_FOLDER.exists():
-
-        print("Cannot access network folder:")
-        print(IMAGE_FOLDER)
+    if not BASE_FOLDER.exists():
+        print("Cannot access:")
+        print(BASE_FOLDER)
         print()
-        print("Check your VPN connection.")
-
+        print("Make sure Connect Tunnel VPN is connected.")
         return
 
     connection = initialize_database()
 
-    images = sorted(
-        file
-        for file in IMAGE_FOLDER.iterdir()
-        if (
-            file.is_file()
-            and file.suffix.lower()
-            in IMAGE_EXTENSIONS
-        )
-    )
+    images = []
 
-    print(f"Found {len(images)} images.")
+    print("Scanning batch folders...")
+    print("=" * 60)
 
-    # Only process first TEST_LIMIT images.
-    images = images[:TEST_LIMIT]
+    for batch_number in range(BATCH_START, BATCH_END + 1):
+
+        batch_name = f"batch_{batch_number:02d}"
+        batch_folder = BASE_FOLDER / batch_name
+
+        if not batch_folder.exists():
+            print(f"{batch_name}: MISSING - skipping")
+            continue
+
+        try:
+            batch_images = get_batch_images(batch_folder)
+
+        except OSError:
+            print()
+            print(f"Could not reliably access {batch_name}.")
+            print("Reconnect VPN and run the script again.")
+            connection.close()
+            return
+
+        print(f"{batch_name}: {len(batch_images)} images")
+
+        for image_path in batch_images:
+            images.append(
+                (
+                    batch_name,
+                    image_path,
+                )
+            )
 
     total = len(images)
 
-    print(
-        f"Processing first {total} images."
-    )
-
     print("=" * 60)
+    print(f"TOTAL IMAGES FOUND: {total}")
+    print("=" * 60)
+    print()
+
+    processed_this_run = 0
 
     try:
 
-        for number, image_path in enumerate(
+        for number, (batch_name, image_path) in enumerate(
             images,
             start=1,
         ):
 
-            filename = image_path.name
-
-            # ----------------------------------------
-            # Check network share before processing.
-            # ----------------------------------------
-
-            if not IMAGE_FOLDER.exists():
-
+            if not BASE_FOLDER.exists():
                 print()
-                print(
-                    "NETWORK SHARE DISCONNECTED."
-                )
-
-                print(
-                    "Stopping safely. "
-                    "Existing results are preserved."
-                )
-
+                print("NETWORK SHARE DISCONNECTED.")
+                print("Stopping safely.")
                 break
 
-            # ----------------------------------------
-            # Resume / checkpoint
-            # ----------------------------------------
+            filename = image_path.name
+
+            relative_path = str(
+                image_path.relative_to(BASE_FOLDER)
+            )
 
             if already_successful(
                 connection,
-                filename,
+                relative_path,
             ):
 
                 print(
                     f"[{number}/{total}] "
-                    f"Skipping {filename} "
+                    f"Skipping {relative_path} "
                     f"(already complete)"
                 )
 
@@ -524,7 +585,7 @@ def main():
 
             print(
                 f"[{number}/{total}] "
-                f"Processing {filename}"
+                f"Processing {relative_path}"
             )
 
             try:
@@ -537,6 +598,8 @@ def main():
 
                 save_result(
                     connection=connection,
+                    relative_path=relative_path,
+                    batch=batch_name,
                     filename=filename,
                     first_name=first_name,
                     last_name=last_name,
@@ -546,17 +609,13 @@ def main():
                 )
 
                 print(
-                    f"    {first_name} "
-                    f"{last_name}"
+                    f"    {first_name} {last_name}"
                 )
-
                 print(
                     f"    Color: {color}"
                 )
-
                 print(
-                    f"    Confidence: "
-                    f"{confidence}"
+                    f"    Confidence: {confidence}"
                 )
 
             except Exception as error:
@@ -565,6 +624,8 @@ def main():
 
                 save_result(
                     connection=connection,
+                    relative_path=relative_path,
+                    batch=batch_name,
                     filename=filename,
                     first_name=first_name,
                     last_name=last_name,
@@ -575,40 +636,39 @@ def main():
                 )
 
                 print("    FAILED")
-                print(
-                    f"    {error_message}"
-                )
+                print(f"    {error_message}")
 
-            # Export after every image for this small test.
-            export_csv(connection)
+            processed_this_run += 1
+
+            if (
+                processed_this_run
+                % CSV_EXPORT_INTERVAL
+                == 0
+            ):
+                print("    Updating CSV...")
+                export_csv(connection)
 
             print()
 
     except KeyboardInterrupt:
 
         print()
-        print("=" * 60)
-        print("Processing stopped by user.")
+        print("Stopped by user.")
         print(
-            "Everything completed so far "
-            "has been saved."
+            "Completed results have already been saved."
         )
 
     finally:
 
-        # Rebuild CSV from database before exit.
+        print("Creating final CSV...")
         export_csv(connection)
-
         connection.close()
 
     print()
     print("=" * 60)
-    print("Finished.")
-    print(f"Results: {CSV_FILE}")
-    print(
-        f"Checkpoint database: "
-        f"{DATABASE_FILE}"
-    )
+    print("RUN FINISHED")
+    print(f"Database: {DATABASE_FILE}")
+    print(f"CSV: {CSV_FILE}")
 
 
 if __name__ == "__main__":
